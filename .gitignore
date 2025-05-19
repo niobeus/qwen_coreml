@@ -1,0 +1,4 @@
+.venv
+Stateful*
+__pycache__
+.mypy*
