@@ -7,22 +7,22 @@ import coremltools as ct
 import numpy as np
 import torch
 from transformers.cache_utils import Cache
-from transformers.models.mistral.modeling_mistral import (
-    MISTRAL_ATTENTION_CLASSES,
-    MistralAttention,
-    MistralConfig,
-    MistralForCausalLM,
+
+import math
+
+from transformers.models.qwen2.modeling_qwen2 import (
+    QWEN2_ATTENTION_CLASSES,
+    Qwen2Attention,
+    Qwen2Config,
+    Qwen2ForCausalLM,
     apply_rotary_pos_emb,
     repeat_kv,
 )
-
-ACCESS_TOKEN_ID = "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"
 
 warnings.filterwarnings("ignore")
 logging.getLogger("coremltools").setLevel(logging.ERROR)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3
 MODEL_ID: str = "Qwen/Qwen2.5-1.5B-Instruct"
 METADATA_TOKENIZER: str = "co.huggingface.exporters.name"
 
@@ -37,6 +37,7 @@ class SliceUpdateKeyValueCache(Cache):
         """KV cache of shape (#layers, batch_size, #kv_heads, context_size, head_dim)."""
         super().__init__()
         self.past_seen_tokens: int = 0
+        self.max_seq_len = shape[-2]
         self.k_cache: torch.Tensor = torch.zeros(shape, dtype=dtype, device=device)
         self.v_cache: torch.Tensor = torch.zeros(shape, dtype=dtype, device=device)
 
@@ -66,9 +67,13 @@ class SliceUpdateKeyValueCache(Cache):
         """Get the sequence length of the cache."""
         return self.past_seen_tokens
 
+    def get_max_length(self, _: int | None = 0) -> int:
+        """Get the sequence length of the cache."""
+        return self.max_seq_len
 
-class SliceUpdateMistralAttention(MistralAttention):
-    def __init__(self, config: MistralConfig, layer_idx: Optional[int] = None):
+
+class SliceUpdateQwen2Attention(Qwen2Attention):
+    def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
         super().__init__(config=config, layer_idx=layer_idx)
 
     @torch.no_grad()
@@ -79,7 +84,7 @@ class SliceUpdateMistralAttention(MistralAttention):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor | None, ...]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -96,51 +101,60 @@ class SliceUpdateMistralAttention(MistralAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        kv_seq_len = key_states.shape[-2]
+
+        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
+            query_states, key_states, cos, sin, position_ids
         )
 
-        # Slice update key/value cache
         end_step = attention_mask.shape[-1]
         key_states, value_states = past_key_value.update(
-            key_states,
-            value_states,
-            self.layer_idx,
-            slice_indices=(end_step - q_len, end_step),
+            key_states, value_states, self.layer_idx, (end_step - q_len, end_step)
         )
 
+        # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
+        attn_weights = torch.matmul(
+            query_states, key_states.transpose(2, 3)
+        ) / math.sqrt(self.head_dim)
+
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+        # upcast attention to fp32
+        attn_weights = torch.nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attn_weights = torch.nn.functional.dropout(
+            attn_weights, p=self.attention_dropout, training=self.training
         )
+        attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+
         attn_output = self.o_proj(attn_output)
+
         return attn_output, None, None
 
 
-class StatefulMistralForCausalLM(torch.nn.Module):
+class StatefulQwen2ForCausalLM(torch.nn.Module):
     def __init__(
-        self, model_path: str, max_context_size: int = 2048, batch_size: int = 1
+        self, model_path: str, max_context_size: int = 256, batch_size: int = 1
     ) -> None:
         super().__init__()
 
         # Custom attention implementation for stateful slice update key/value cache, override
         # "sdpa" to compliance with transformers.modeling_utils._autoset_attn_implementation
-        MISTRAL_ATTENTION_CLASSES["sdpa"] = SliceUpdateMistralAttention
-        self.model = MistralForCausalLM.from_pretrained(
-            model_path, token=ACCESS_TOKEN_ID
-        )
+        QWEN2_ATTENTION_CLASSES["sdpa"] = SliceUpdateQwen2Attention
+        self.model = Qwen2ForCausalLM.from_pretrained(model_path)
 
         # Register KV cache buffers to be recognized as Core ML states
-        config: MistralConfig = self.model.config
+        config: Qwen2Config = self.model.config
         self.kv_cache_shape: Tuple[int, ...] = (
             config.num_hidden_layers,
             batch_size,
@@ -170,10 +184,8 @@ class StatefulMistralForCausalLM(torch.nn.Module):
 
 def export() -> None:
     # Construct model from transformers and trace to TorchScript
-    max_context_size: int = 2048
-    torch_model = StatefulMistralForCausalLM(
-        MODEL_ID, max_context_size=max_context_size
-    )
+    max_context_size: int = 1024
+    torch_model = StatefulQwen2ForCausalLM(MODEL_ID, max_context_size=max_context_size)
     torch_model.eval()
     input_ids: torch.Tensor = torch.zeros((1, 2), dtype=torch.int32)
     causal_mask: torch.Tensor = torch.zeros((1, 1, 2, 5), dtype=torch.float32)
@@ -216,25 +228,25 @@ def export() -> None:
     del traced_model
 
     # Block-wise quantize model weights to int4
-    # op_config = ct.optimize.coreml.OpLinearQuantizerConfig(
-    #     mode="linear_symmetric",
-    #     dtype="int4",
-    #     granularity="per_block",
-    #     block_size=16,
-    # )
-    # config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
-    # mlmodel_int4 = ct.optimize.coreml.linear_quantize_weights(
-    #     mlmodel_fp16, config=config
-    # )
-    # mlmodel_int4._spec.description.metadata.userDefined.update(
-    #     {METADATA_TOKENIZER: MODEL_ID}
-    # )
+    op_config = ct.optimize.coreml.OpLinearQuantizerConfig(
+        mode="linear_symmetric",
+        dtype="int4",
+        granularity="per_block",
+        block_size=32,
+    )
+    config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
+    mlmodel_int4 = ct.optimize.coreml.linear_quantize_weights(
+        mlmodel_fp16, config=config
+    )
+    mlmodel_int4._spec.description.metadata.userDefined.update(
+        {METADATA_TOKENIZER: MODEL_ID}
+    )
     mlmodel_fp16._spec.description.metadata.userDefined.update(
         {METADATA_TOKENIZER: MODEL_ID}
     )
     # del mlmodel_fp16
-    # mlmodel_int4.save("StatefulQwen2.51.5BInstruct.mlpackage")
-    mlmodel_fp16.save("StatefulQwen2.51.5BInstruct.mlpackage")
+    mlmodel_int4.save("StatefulQwen2.51.5BInstructInt4Block32.mlpackage")
+    mlmodel_fp16.save("StatefulQwen2.51.5BInstructFp16.mlpackage")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@ from coremltools.models import MLModel
 from transformers import AutoTokenizer
 
 from export import METADATA_TOKENIZER
-from export import ACCESS_TOKEN_ID
 
 
 def load(model_path: str) -> Tuple[MLModel, AutoTokenizer]:
@@ -16,9 +15,7 @@ def load(model_path: str) -> Tuple[MLModel, AutoTokenizer]:
     if METADATA_TOKENIZER not in description.metadata.userDefined:
         raise ValueError("Model metadata does not contain tokenizer path.")
     tokenizer_path: str = description.metadata.userDefined[METADATA_TOKENIZER]
-    tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path, token=ACCESS_TOKEN_ID
-    )
+    tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     return model, tokenizer
 
 
@@ -42,6 +39,7 @@ def get_next_token(
             ),
             k=1,
         ).astype(np.float16)
+
         outputs: Dict[str, np.ndarray] = model.predict(
             data={"inputIds": input_ids, "causalMask": causal_mask},
             state=kv_cache_state,
