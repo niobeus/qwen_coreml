@@ -4,7 +4,6 @@ from tqdm import tqdm
 import torch
 import argparse
 from typing import Dict
-from transformers.trainer_utils import set_seed
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 from transformers import AutoTokenizer
 from coremltools.models import MLModel
@@ -57,12 +56,6 @@ def coreml_predict(
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark PyTorch and CoreML models")
     parser.add_argument(
-        "--prompt",
-        type=str,
-        default="Hello, my dear friend",
-        help="Input prompt for text generation",
-    )
-    parser.add_argument(
         "--torch-model",
         type=str,
         default="Qwen/Qwen2.5-1.5B-Instruct",
@@ -75,17 +68,37 @@ def parse_args():
         help="Path to the CoreML model package",
     )
     parser.add_argument(
+        "--benchmark-mode",
+        type=str,
+        choices=["generation", "context"],
+        default="generation",
+        help="Benchmark mode: 'generation' for KV cache generation, 'context' for context preparation",
+    )
+    parser.add_argument(
         "--n-cycles", type=int, default=128, help="Number of generation cycles"
+    )
+    # generation mode
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="Hello, my dear friend",
+        help="Input prompt for text generation",
+    )
+    parser.add_argument(
+        "--print-output",
+        action="store_true",
+        help="Print generated output for generation mode",
+    )
+    # context mode
+    parser.add_argument(
+        "--input-length", type=int, default=1024, help="Input Length for context mode"
     )
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    args = parse_args()
-
-    torch_model, torch_tokenizer = load_torch_model(args.torch_model)
-    coreml_model, coreml_tokenizer = load_coreml_model(args.coreml_model)
-
+def benchmark_generation(
+    torch_model, torch_tokenizer, coreml_model, coreml_tokenizer, args
+):
     inputs = torch_tokenizer([args.prompt], return_tensors="pt")
     inputs = inputs.to(torch_model.device)
     past_key_values = None
@@ -130,8 +143,70 @@ if __name__ == "__main__":
 
     coreml_time_cost = time.time() - start_time
 
-    print("Time cost of Torch model:", torch_time_cost)
-    print("Time cost of CoreML model:", coreml_time_cost)
+    print("Total time of Torch model Inference:", torch_time_cost)
+    print("Total time of CoreML model Inference:", coreml_time_cost)
 
-    print("Torch output: ", torch_tokenizer.decode(torch_outputs))
-    print("CoreML output: ", coreml_tokenizer.decode(coreml_outputs))
+    if args.print_output:
+        print("\nTorch output: ", torch_tokenizer.decode(torch_outputs))
+        print("\nCoreML output: ", coreml_tokenizer.decode(coreml_outputs))
+
+
+def benchmark_context(torch_model, coreml_model, args):
+    print("\nWARNING: Using random input data for context preparation benchmark")
+
+    vocab_size = torch_model.config.vocab_size
+    random_input = torch.randint(
+        0, vocab_size, (1, args.input_length), device=torch_model.device
+    )
+
+    _ = torch_model.forward(input_ids=random_input)
+
+    torch_times = []
+    with torch.inference_mode():
+        for _ in tqdm(range(args.n_cycles)):
+            start_time = time.time()
+            _ = torch_model.forward(input_ids=random_input)
+            torch_times.append(time.time() - start_time)
+
+    random_input = random_input.cpu().numpy().astype(np.int32)
+    kv_cache_state = coreml_model.make_state()
+    _ = coreml_predict(coreml_model, random_input, kv_cache_state, 0)
+
+    coreml_times = []
+    for _ in tqdm(range(args.n_cycles)):
+        start_time = time.time()
+        kv_cache_state = coreml_model.make_state()
+        _ = coreml_predict(coreml_model, random_input, kv_cache_state, 0)
+        coreml_times.append(time.time() - start_time)
+
+    print("\nPyTorch stats:")
+    print(
+        f"Average time per token: {sum(torch_times) / len(torch_times) / args.n_cycles:.4f} seconds"
+    )
+    print(f"Min time per token: {min(torch_times):.4f} seconds")
+    print(f" Max time per token: {max(torch_times):.4f} seconds")
+
+    print("\nCoreML stats:")
+    print(
+        f"Average time per token: {sum(coreml_times) / len(coreml_times) / args.n_cycles:.4f} seconds"
+    )
+    print(f"Min time per token: {min(coreml_times):.4f} seconds")
+    print(f"Max time per token: {max(coreml_times):.4f} seconds")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    torch_model, torch_tokenizer = load_torch_model(args.torch_model)
+    coreml_model, coreml_tokenizer = load_coreml_model(args.coreml_model)
+
+    if args.benchmark_mode == "generation":
+        benchmark_generation(
+            torch_model, torch_tokenizer, coreml_model, coreml_tokenizer, args
+        )
+    elif args.benchmark_mode == "context":
+        benchmark_context(torch_model, coreml_model, args)
+    else:
+        raise ValueError(
+            f"Invalid benchmark mode: {args.benchmark_mode}. Must be either 'generation' or 'context'"
+        )
