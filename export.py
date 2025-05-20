@@ -222,8 +222,9 @@ def export() -> None:
         inputs=inputs,
         outputs=outputs,
         states=states,
-        minimum_deployment_target=ct.target.iOS18,
+        minimum_deployment_target=ct.target.macOS15,
         skip_model_load=True,
+        compute_units=ct.ComputeUnit.ALL,
     )
     del traced_model
 
@@ -236,7 +237,8 @@ def export() -> None:
     )
     config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
     mlmodel_int4 = ct.optimize.coreml.linear_quantize_weights(
-        mlmodel_fp16, config=config
+        mlmodel_fp16,
+        config=config,
     )
     mlmodel_int4._spec.description.metadata.userDefined.update(
         {METADATA_TOKENIZER: MODEL_ID}
